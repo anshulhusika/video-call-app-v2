@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { supabase, Participant } from '../lib/supabase';
 import { useMediaStream } from '../hooks/useMediaStream';
 import { useWebRTC } from '../hooks/useWebRTC';
@@ -25,101 +25,62 @@ export function VideoCall({ roomId, displayName, userId, onLeave }: VideoCallPro
     toggleVideo,
   } = useMediaStream();
 
-  // Make peerId stable for component lifetime
-  const peerIdRef = useRef(`${userId}-${Math.random().toString(36).slice(2, 9)}`);
-  const peerId = peerIdRef.current;
-
-  // UseWebRTC should be resilient to localStream being null initially.
+  const peerId = `${userId}-${Date.now()}`;
   const { peers, initiateCall } = useWebRTC(roomId, peerId, localStream);
-
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [copied, setCopied] = useState(false);
 
-  // start media on mount
   useEffect(() => {
     startMedia();
   }, [startMedia]);
 
-  // Insert participant row once localStream is available
   useEffect(() => {
     if (!localStream) return;
 
-    let isMounted = true;
-
     const joinRoom = async () => {
-      try {
-        await supabase.from('participants').insert({
-          room_id: roomId,
-          user_id: userId,
-          peer_id: peerId,
-          display_name: displayName,
-          is_active: true,
-        });
+      await supabase.from('participants').insert({
+        room_id: roomId,
+        user_id: userId,
+        peer_id: peerId,
+        display_name: displayName,
+        is_active: true,
+      });
 
-        await supabase.from('rooms').update({ status: 'active' }).eq('id', roomId);
-      } catch (err) {
-        console.error('joinRoom error', err);
-      }
+      await supabase.from('rooms').update({ status: 'active' }).eq('id', roomId);
     };
 
     joinRoom();
 
     return () => {
-      if (!isMounted) return;
-      (async () => {
-  try {
-    await supabase
-      .from('participants')
-      .update({ is_active: false, left_at: new Date().toISOString() })
-      .eq('peer_id', peerId);
-  } catch (e) {
-    console.warn('failed to mark participant left', e);
-  }
-})();
-
-      isMounted = false;
+      supabase.from('participants').update({ is_active: false, left_at: new Date().toISOString() }).eq('peer_id', peerId);
     };
   }, [localStream, roomId, userId, peerId, displayName]);
 
-  // Subscribe to participant changes (INSERT/UPDATE)
   useEffect(() => {
     const channel = supabase.channel(`room:${roomId}:participants`);
 
     channel
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'participants',
-          filter: `room_id=eq.${roomId}`,
-        },
-        async (payload) => {
-          try {
-            if (payload.eventType === 'INSERT') {
-              const newParticipant = payload.new as Participant;
-              if (newParticipant.peer_id !== peerId && newParticipant.is_active) {
-                setParticipants((prev) => {
-                  // avoid duplicates
-                  if (prev.some((p) => p.peer_id === newParticipant.peer_id)) return prev;
-                  return [...prev, newParticipant];
-                });
-                await initiateCall(newParticipant.peer_id);
-              }
-            } else if (payload.eventType === 'UPDATE') {
-              const updatedParticipant = payload.new as Participant;
-              if (!updatedParticipant.is_active) {
-                setParticipants((prev) => prev.filter((p) => p.peer_id !== updatedParticipant.peer_id));
-              }
-            }
-          } catch (err) {
-            console.error('participant change handler error', err);
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'participants',
+        filter: `room_id=eq.${roomId}`,
+      }, async (payload) => {
+        if (payload.eventType === 'INSERT') {
+          const newParticipant = payload.new as Participant;
+          if (newParticipant.peer_id !== peerId && newParticipant.is_active) {
+            setParticipants((prev) => [...prev, newParticipant]);
+            await initiateCall(newParticipant.peer_id);
+          }
+        } else if (payload.eventType === 'UPDATE') {
+          const updatedParticipant = payload.new as Participant;
+          if (!updatedParticipant.is_active) {
+            setParticipants((prev) => prev.filter((p) => p.peer_id !== updatedParticipant.peer_id));
           }
         }
-      )
+      })
       .subscribe();
 
-    // fetch existing participants
     const fetchExistingParticipants = async () => {
       const { data } = await supabase
         .from('participants')
@@ -127,21 +88,16 @@ export function VideoCall({ roomId, displayName, userId, onLeave }: VideoCallPro
         .eq('room_id', roomId)
         .eq('is_active', true)
         .neq('peer_id', peerId);
+
       if (data) {
-        setParticipants((prev) => {
-          const ids = new Set(prev.map((p) => p.peer_id));
-          const merged = [...prev];
-          for (const p of data) {
-            if (!ids.has(p.peer_id)) merged.push(p);
-            // initiate call for each (hook will ignore duplicates)
-            initiateCall(p.peer_id).catch((e) => console.error('initiateCall error', e));
-          }
-          return merged;
+        setParticipants(data);
+        data.forEach((participant) => {
+          initiateCall(participant.peer_id);
         });
       }
     };
 
-    fetchExistingParticipants().catch((e) => console.error(e));
+    fetchExistingParticipants();
 
     return () => {
       channel.unsubscribe();
@@ -149,16 +105,12 @@ export function VideoCall({ roomId, displayName, userId, onLeave }: VideoCallPro
   }, [roomId, peerId, initiateCall]);
 
   const handleEndCall = useCallback(async () => {
-    try {
-      await supabase
-        .from('participants')
-        .update({ is_active: false, left_at: new Date().toISOString() })
-        .eq('peer_id', peerId);
-    } catch (err) {
-      console.error('end call update failed', err);
-    } finally {
-      onLeave();
-    }
+    await supabase
+      .from('participants')
+      .update({ is_active: false, left_at: new Date().toISOString() })
+      .eq('peer_id', peerId);
+
+    onLeave();
   }, [peerId, onLeave]);
 
   const copyRoomId = useCallback(() => {
@@ -167,12 +119,11 @@ export function VideoCall({ roomId, displayName, userId, onLeave }: VideoCallPro
     setTimeout(() => setCopied(false), 2000);
   }, [roomId]);
 
-  // Filter peers using the stable peerId
   const remotePeers = peers.filter((peer) => peer.peerId !== peerId);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 flex flex-col relative overflow-hidden">
-      {/* ... header and UI unchanged ... */}
+      <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGRlZnM+PHBhdHRlcm4gaWQ9ImdyaWQiIHdpZHRoPSI2MCIgaGVpZ2h0PSI2MCIgcGF0dGVyblVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHBhdGggZD0iTSAxMCAwIEwgMCAwIDAgMTAiIGZpbGw9Im5vbmUiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS1vcGFjaXR5PSIwLjAzIiBzdHJva2Utd2lkdGg9IjEiLz48L3BhdHRlcm4+PC9kZWZzPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9InVybCgjZ3JpZCkiLz48L3N2Zz4=')] opacity-50" />
 
       <div className="relative z-10 flex flex-col h-screen">
         <div className="p-4 flex items-center justify-between bg-black/30 backdrop-blur-md border-b border-white/10">
@@ -191,7 +142,9 @@ export function VideoCall({ roomId, displayName, userId, onLeave }: VideoCallPro
             className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 backdrop-blur-sm rounded-xl text-white transition-all duration-200 border border-white/20"
           >
             {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-            <span className="text-sm font-medium hidden md:inline">{copied ? 'Copied!' : 'Copy Room ID'}</span>
+            <span className="text-sm font-medium hidden md:inline">
+              {copied ? 'Copied!' : 'Copy Room ID'}
+            </span>
           </button>
         </div>
 
